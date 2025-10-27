@@ -1,0 +1,487 @@
+from skimage import io, exposure, feature, measure, morphology, transform
+from skimage.draw import disk, polygon, ellipse
+from scipy.ndimage import gaussian_filter
+from scipy.spatial import cKDTree
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+# =================== GLOBAL DEFAULTS ===================
+
+PAIRS = [
+    ("Cornoil-HDM-20x.tif", "Cornoil-HDM-20x-1.png"),
+    ("TAM-HDM-20x.tif",     "TAM-HDM-20x.png"),
+]
+
+UM_PER_PX_TIF   = 0.568
+PAIR_RADIUS_UM  = 10.0
+
+# --- robust PNG channel extraction (0..1) ---
+R_IDX, G_IDX, B_IDX = 0, 1, 2
+GATA_SUPPRESS_K     = 0.8    # GATA3 ~ R - k*max(G,B)
+C3_GREEN_SUPPRESS   = 0.9    # C3    ~ min(R,B) - k*G
+APPLY_GAMMA         = 1.0
+
+# --- color-purity filters ---
+APPLY_COLOR_FILTERS   = True
+GATA_RED_MARGIN       = 0.04
+GATA_MIN_RED_FRAC     = 0.42
+C3_MAGENTA_MARGIN     = 0.04
+C3_MIN_MAGENTA_FRAC   = 0.58
+
+# --- TIFF gating (resize TIFF channels to PNG; keep peaks above percentile) ---
+TIFF_GATE_ENABLED     = True
+TIFF_GATA_CHANNEL     = 0      # TIFF ch1 = GATA3
+TIFF_C3_CHANNEL       = 3      # TIFF ch4 = C3
+TIFF_GATA_MIN_PCTL    = 92.0
+TIFF_C3_MIN_PCTL      = 92.0
+
+# --- peak detection (no segmentation) ---
+GAUSS_BEFORE_LOCALMAX_SIGMA = 1.0
+LOCALMAX_MIN_DIST_PX        = 5
+LOCALMAX_ABS_THRESH         = None
+LOCALMAX_REL_THRESH         = 0.06
+MAX_POINTS_PER_CHANNEL      = None
+
+# --- density / calling ---
+DENSITY_SMOOTH_SIGMA = 2.5
+HOTSPOT_TOP_PERCENT  = 98.5
+
+# --- scalebar removal (for detection ONLY) ---
+IGNORE_SCALEBAR            = True
+SCALEBAR_COLOR             = "yellow"  # or "white"
+SEARCH_BOTTOM_FRAC         = 0.12
+SEARCH_RIGHT_FRAC          = 0.35
+SCALEBAR_MAX_HEIGHT_FRAC   = 0.04
+SCALEBAR_MIN_ASPECT        = 8.0
+SCALEBAR_MIN_AREA_FRAC     = 6e-6
+SCALEBAR_DILATE_PX         = 2
+MANUAL_EXCLUDE_BOX         = None      # (y0,y1,x0,x1) or None
+
+# --- ROI-set exclusion (epithelium) ---
+ROISET_EXCLUDE = {
+    "TAM-HDM-20x": "RoiSet-TAM.zip",
+}
+ROI_EXCLUDE_MODE = "inside"   # "inside" | "outside"
+ROI_DILATE_PX    = 3
+
+# --- pair exclusion rule w.r.t. excluded mask ---
+PAIR_EXCLUSION_MODE = "bothpoints"  # "midpoint" | "bothpoints" | "anypoint" | "none"
+
+# --- DRAWN SCALE BAR on exported images (new) ---
+DRAW_SCALEBAR            = True
+SCALEBAR_LENGTH_UM       = 50         # label will say “50 µm”
+SCALEBAR_THICKNESS_PX    = 6
+SCALEBAR_MARGIN_PX       = 40
+SCALEBAR_COLOR_RGB       = (255, 255, 255)
+SCALEBAR_TEXT            = True       # requires Pillow; falls back to bar-only if unavailable
+SCALEBAR_TEXT_SIZE       = 26
+
+# --- Per-image OVERRIDES (gentler for TAM so it’s not “too bare”) ---
+OVERRIDES = {
+    # key is PNG stem
+    "TAM-HDM-20x": {
+        "LOCALMAX_REL_THRESH": 0.05,     # a little more sensitive
+        "LOCALMAX_MIN_DIST_PX": 4,
+        "TIFF_GATA_MIN_PCTL":  88.0,     # relax TIFF gating
+        "TIFF_C3_MIN_PCTL":    88.0,
+        "GATA_RED_MARGIN":     0.035,    # slightly easier color pass
+        "C3_MAGENTA_MARGIN":   0.035,
+        "GATA_MIN_RED_FRAC":   0.40,
+        "C3_MIN_MAGENTA_FRAC": 0.56,
+        "HOTSPOT_TOP_PERCENT": 98.0,     # call a bit more area as hotspot
+        "DENSITY_SMOOTH_SIGMA": 2.0,
+        # if a boundary contact was lost, consider:
+        # "PAIR_EXCLUSION_MODE": "bothpoints",
+        # and reduce ROI_DILATE_PX if needed
+    },
+}
+# =====================================================
+
+
+# ============== helpers (IO, scaling, extraction) ==============
+def load_tif_hwC(path):
+    a = np.asarray(io.imread(path))
+    if a.ndim == 2: a = a[..., None]
+    elif a.ndim == 3:
+        if a.shape[0] in (3,4) and a.shape[1] != a.shape[2]:
+            a = np.moveaxis(a,0,-1)
+        elif a.shape[-1] in (3,4): pass
+        else: a = np.moveaxis(a,0,-1)
+    else:
+        H,W = a.shape[-2], a.shape[-1]
+        a = np.moveaxis(a.reshape(-1,H,W),0,-1)
+    return a.astype(np.float32)
+
+def load_png_rgb(path):
+    img = io.imread(path)
+    if img.ndim == 2: img = np.stack([img,img,img], axis=-1)
+    elif img.shape[-1] == 4: img = img[...,:3]
+    img = img.astype(np.float32)
+    if img.max() > 1.1: img /= 255.0
+    return img
+
+def normalize_for_view(img):
+    p2,p98 = np.percentile(img,(2,98))
+    return exposure.rescale_intensity(img, in_range=(p2,p98), out_range=(0,1))
+
+def apply_gamma(x,gamma):
+    return x if gamma==1.0 else np.power(np.clip(x,0,1), gamma)
+
+def png_um_per_px_from_tif(tif_hw, png_hw, um_per_px_tif):
+    Ht,Wt = tif_hw; Hp,Wp = png_hw
+    sx,sy = Wt/Wp, Ht/Hp
+    if abs(sx-sy) > 0.02*max(sx,sy):
+        print(f"[WARN] PNG/TIFF scale mismatch (Wx {sx:.4f}, Hy {sy:.4f}); using average.")
+    return um_per_px_tif*0.5*(sx+sy)
+
+def extract_gata_from_png(rgb):
+    R,G,B = rgb[...,R_IDX], rgb[...,G_IDX], rgb[...,B_IDX]
+    gata  = R - GATA_SUPPRESS_K*np.maximum(G,B)
+    gata  = np.clip(gata,0,None)
+    gata  = gata/(gata.max()+1e-8)
+    return apply_gamma(gata, APPLY_GAMMA)
+
+def extract_c3_from_png(rgb):
+    R,G,B = rgb[...,R_IDX], rgb[...,G_IDX], rgb[...,B_IDX]
+    c3    = np.minimum(R,B) - C3_GREEN_SUPPRESS*G
+    c3    = np.clip(c3,0,None)
+    c3    = c3/(c3.max()+1e-8)
+    return apply_gamma(c3, APPLY_GAMMA)
+
+# ============== scalebar removal & ROI mask ==============
+def make_scalebar_mask(rgb):
+    if not IGNORE_SCALEBAR: return np.zeros(rgb.shape[:2], dtype=bool)
+    H,W,_ = rgb.shape
+    y0 = int(H*(1-SEARCH_BOTTOM_FRAC)); x0 = int(W*(1-SEARCH_RIGHT_FRAC))
+    win = np.zeros((H,W), dtype=bool); win[y0:, x0:] = True
+    R,G,B = rgb[...,0], rgb[...,1], rgb[...,2]
+    def nrm(x):
+        p2,p98 = np.percentile(x,(2,98))
+        return np.clip((x-p2)/(p98-p2+1e-8), 0, 1)
+    Rn,Gn,Bn = nrm(R), nrm(G), nrm(B)
+    hi = 0.85
+    if SCALEBAR_COLOR.lower()=="white":
+        cand = (Rn>hi)&(Gn>hi)&(Bn>hi)
+    else:
+        cand = ((Rn>hi)&(Gn>hi)&(Bn<0.35)) | ((Rn>hi)&(Gn>hi)&(Bn>hi))  # yellow bar + white text
+    cand &= win
+    cand = morphology.remove_small_objects(cand, min_size=int(H*W*SCALEBAR_MIN_AREA_FRAC))
+    lbl  = measure.label(cand)
+    if lbl.max()==0: return np.zeros((H,W), dtype=bool)
+    keep = np.zeros((H,W), dtype=bool)
+    for p in measure.regionprops(lbl):
+        yb,xb,ye,xe = p.bbox; h,w = (ye-yb),(xe-xb)
+        if h==0: continue
+        aspect = w/float(h)
+        near_bottom = ye >= H*(1-SEARCH_BOTTOM_FRAC/2)
+        if near_bottom and aspect>=SCALEBAR_MIN_ASPECT and (h/H)<=SCALEBAR_MAX_HEIGHT_FRAC:
+            keep |= (lbl==p.label)
+    if SCALEBAR_DILATE_PX>0: keep = morphology.binary_dilation(keep, morphology.disk(SCALEBAR_DILATE_PX))
+    return keep
+
+def roi_zip_to_mask(zip_path, shape_hw):
+    from read_roi import read_roi_zip
+    H,W = shape_hw
+    if not Path(zip_path).exists(): return np.zeros((H,W), dtype=bool)
+    rois = read_roi_zip(str(zip_path))
+    mask = np.zeros((H,W), dtype=bool)
+    max_x = max([max(v.get("x",[0])) if isinstance(v.get("x"), (list,tuple,np.ndarray)) else (v.get("left",0)+v.get("width",0)) for v in rois.values()] + [0])
+    max_y = max([max(v.get("y",[0])) if isinstance(v.get("y"), (list,tuple,np.ndarray)) else (v.get("top",0)+v.get("height",0)) for v in rois.values()] + [0])
+    sx = (W-1)/max(1,max_x) if max_x>W else 1.0
+    sy = (H-1)/max(1,max_y) if max_y>H else 1.0
+    for r in rois.values():
+        t = r.get("type","").lower()
+        if t in ("polygon","freehand","traced","polyline","freeline"):
+            xs = np.asarray(r["x"], dtype=float)*sx; ys = np.asarray(r["y"], dtype=float)*sy
+            rr,cc = polygon(ys, xs, (H,W)); mask[rr,cc]=True
+        elif t in ("rectangle","rect"):
+            x,y = float(r["left"])*sx, float(r["top"])*sy; w,h = float(r["width"])*sx, float(r["height"])*sy
+            x0,x1 = int(round(x)), int(round(x+w)); y0,y1 = int(round(y)), int(round(y+h))
+            mask[max(0,y0):min(H,y1), max(0,x0):min(W,x1)] = True
+        elif t in ("oval","ellipse"):
+            x,y = float(r["left"])*sx, float(r["top"])*sy; w,h = float(r["width"])*sx, float(r["height"])*sy
+            rr,cc = ellipse(int(round(y+h/2)), int(round(x+w/2)), int(round(h/2)), int(round(w/2)), shape=(H,W))
+            mask[rr,cc]=True
+    if ROI_DILATE_PX>0: mask = morphology.binary_dilation(mask, morphology.disk(ROI_DILATE_PX))
+    mask = morphology.remove_small_holes(mask, area_threshold=64)
+    return mask
+
+# ============== detection & gating ==============
+def detect_local_maxima(channel_img, min_dist_px, abs_thr, rel_thr):
+    work = gaussian_filter(channel_img, GAUSS_BEFORE_LOCALMAX_SIGMA) if GAUSS_BEFORE_LOCALMAX_SIGMA else channel_img
+    thr  = float(channel_img.max())*float(rel_thr) if abs_thr is None else float(abs_thr)
+    pts  = feature.peak_local_max(work, min_distance=int(max(1,min_dist_px)), threshold_abs=thr, exclude_border=False)
+    if pts is None or len(pts)==0: return np.empty((0,2), dtype=float)
+    pts = pts.astype(float)
+    return pts
+
+def filter_points_by_color(points, rgb, mode, margins):
+    APPLY, G_RED_M, G_RED_FR, C3_MAG_M, C3_MAG_FR = margins
+    if not APPLY or len(points)==0: return points
+    R,G,B = rgb[...,R_IDX], rgb[...,G_IDX], rgb[...,B_IDX]
+    kept = []
+    for (y,x) in points:
+        yi,xi = int(round(y)), int(round(x))
+        if not (0<=yi<R.shape[0] and 0<=xi<R.shape[1]): continue
+        r,g,b = float(R[yi,xi]), float(G[yi,xi]), float(B[yi,xi])
+        s = r+g+b + 1e-8
+        if mode=="gata":
+            if (r - max(g,b) >= G_RED_M) and (r/s >= G_RED_FR): kept.append((y,x))
+        else:
+            if (min(r,b) - g >= C3_MAG_M) and ((r+b)/s >= C3_MAG_FR): kept.append((y,x))
+    return np.array(kept, dtype=float) if kept else np.empty((0,2), dtype=float)
+
+def gate_points_by_tiff(points, tif_channel_resized, min_percentile):
+    if not TIFF_GATE_ENABLED or len(points)==0: return points
+    thr = np.percentile(tif_channel_resized, min_percentile)
+    kept = []
+    H,W = tif_channel_resized.shape
+    for (y,x) in points:
+        yi,xi = int(round(y)), int(round(x))
+        if 0<=yi<H and 0<=xi<W and tif_channel_resized[yi,xi] >= thr:
+            kept.append((y,x))
+    return np.array(kept, dtype=float) if kept else np.empty((0,2), dtype=float)
+
+def pair_list(c3_pts, gata_pts, radius_um, um_per_px_png):
+    if len(c3_pts)==0 or len(gata_pts)==0: return []
+    r_px = radius_um/um_per_px_png
+    tree = cKDTree(gata_pts)
+    pairs = []
+    for i, js in enumerate(tree.query_ball_point(c3_pts, r=r_px)):
+        y1,x1 = c3_pts[i]
+        for j in js:
+            y2,x2 = gata_pts[j]
+            pairs.append(((y1,x1), (y2,x2)))
+    return pairs
+
+def filter_pairs_by_exclusion(pairs, excl_mask, mode="bothpoints"):
+    if mode=="none" or not pairs: return pairs
+    H,W = excl_mask.shape
+    kept = []
+    for (p1, p2) in pairs:
+        y1,x1 = int(round(p1[0])), int(round(p1[1]))
+        y2,x2 = int(round(p2[0])), int(round(p2[1]))
+        ymid, xmid = int(round((p1[0]+p2[0])/2)), int(round((p1[1]+p2[1])/2))
+        inside1 = (0<=y1<H and 0<=x1<W and excl_mask[y1,x1])
+        inside2 = (0<=y2<H and 0<=x2<W and excl_mask[y2,x2])
+        insidem = (0<=ymid<H and 0<=xmid<W and excl_mask[ymid,xmid])
+        keep = True
+        if mode=="midpoint":    keep = not insidem
+        elif mode=="anypoint":  keep = not (inside1 or inside2)
+        elif mode=="bothpoints":keep = not (inside1 and inside2)
+        if keep: kept.append((p1,p2))
+    return kept
+
+def midpoints_from_pairs(pairs):
+    return [((p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0) for (p1,p2) in pairs]
+
+def density_and_mask(midpoints, shape_hw, sigma, top_percent):
+    H,W = shape_hw
+    acc = np.zeros((H,W), dtype=np.float32)
+    for (y,x) in midpoints:
+        yi,xi = int(round(y)), int(round(x))
+        if 0<=yi<H and 0<=xi<W: acc[yi,xi]+=1.0
+    D = gaussian_filter(acc, sigma=sigma) if sigma and sigma>0 else acc
+    pos = D[D>0]; thr = np.percentile(pos, top_percent) if pos.size else np.inf
+    return D, D>thr
+
+# ============== drawn scale bar (on outputs) ==============
+def add_scalebar_rgb(img_rgb, um_per_px, length_um=50, thickness_px=6, margin_px=40,
+                     color=(255,255,255), add_text=True, text_size=26):
+    """Draw a bar (and optional text) at bottom-right of an RGB uint8 image."""
+    img = img_rgb.copy()
+    H,W,_ = img.shape
+    length_px = max(1, int(round(length_um/um_per_px)))
+    x2 = W - margin_px
+    x1 = x2 - length_px
+    y2 = H - margin_px
+    y1 = y2 - thickness_px
+    x1 = max(0, x1); y1 = max(0, y1)
+    img[y1:y2, x1:x2] = color
+    if add_text:
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+            im = Image.fromarray(img)
+            draw = ImageDraw.Draw(im)
+            label = f"{int(round(length_um))} µm"
+            # try a default truetype; fallback to PIL default
+            try:
+                font = ImageFont.truetype("DejaVuSans.ttf", text_size)
+            except Exception:
+                font = ImageFont.load_default()
+            tw, th = draw.textbbox((0,0), label, font=font)[2:]
+            tx = x1
+            ty = max(0, y1 - th - 6)
+            draw.text((tx, ty), label, fill=color, font=font)
+            img = np.array(im)
+        except Exception:
+            pass
+    return img
+
+# writers (now with optional scalebar)
+def save_pair_dots_exact(points, shape_hw, save_path, um_per_px_png, add_bar=True):
+    H,W = shape_hw
+    canvas = np.zeros((H,W,3), dtype=np.uint8)
+    for (y,x) in points:
+        yi,xi = int(round(y)), int(round(x))
+        if 0<=yi<H and 0<=xi<W:
+            rr,cc = disk((yi,xi), radius=2, shape=(H,W))
+            canvas[rr,cc,0]=255; canvas[rr,cc,1]=255
+    if add_bar and DRAW_SCALEBAR:
+        canvas = add_scalebar_rgb(canvas, um_per_px_png, SCALEBAR_LENGTH_UM,
+                                  SCALEBAR_THICKNESS_PX, SCALEBAR_MARGIN_PX,
+                                  SCALEBAR_COLOR_RGB, SCALEBAR_TEXT, SCALEBAR_TEXT_SIZE)
+    io.imsave(str(save_path), canvas)
+
+def save_hotspot_mask_exact(mask, save_path, um_per_px_png, add_bar=True):
+    canvas = np.zeros((*mask.shape,3), dtype=np.uint8)
+    canvas[mask,0]=255; canvas[mask,1]=255
+    if add_bar and DRAW_SCALEBAR:
+        canvas = add_scalebar_rgb(canvas, um_per_px_png, SCALEBAR_LENGTH_UM,
+                                  SCALEBAR_THICKNESS_PX, SCALEBAR_MARGIN_PX,
+                                  SCALEBAR_COLOR_RGB, SCALEBAR_TEXT, SCALEBAR_TEXT_SIZE)
+    io.imsave(str(save_path), canvas)
+
+def save_overlay_on_png(rgb_png, mask, points, save_path, um_per_px_png, alpha=0.5):
+    H,W,_ = rgb_png.shape
+    base = (normalize_for_view(rgb_png)*255).astype(np.uint8)
+    overlay = base.copy(); overlay[mask,0]=255; overlay[mask,1]=255
+    comp = (base.astype(float)*(1-alpha) + overlay.astype(float)*alpha).astype(np.uint8)
+    for (y,x) in points:
+        yi,xi = int(round(y)), int(round(x))
+        if 0<=yi<H and 0<=xi<W:
+            rr,cc = disk((yi,xi), radius=2, shape=(H,W))
+            comp[rr,cc,0]=255; comp[rr,cc,1]=255
+    if DRAW_SCALEBAR:
+        comp = add_scalebar_rgb(comp, um_per_px_png, SCALEBAR_LENGTH_UM,
+                                SCALEBAR_THICKNESS_PX, SCALEBAR_MARGIN_PX,
+                                SCALEBAR_COLOR_RGB, SCALEBAR_TEXT, SCALEBAR_TEXT_SIZE)
+    io.imsave(str(save_path), comp)
+
+def summarize_hotspots(mask, um_per_px_png):
+    lbl = measure.label(mask); props = measure.regionprops(lbl)
+    rows = []
+    for p in props:
+        area_px = int(p.area); area_um2 = area_px*(um_per_px_png**2)
+        rows.append({"Label":p.label, "Area_px":area_px, "Area_um2":float(area_um2)})
+    df = pd.DataFrame(rows)
+    summary = {
+        "n_hotspots":      int(len(props)),
+        "total_area_um2":  float(df["Area_um2"].sum()) if len(df) else 0.0,
+        "percent_area":    (float(df["Area_px"].sum())/mask.size*100.0) if len(df) else 0.0,
+        "mean_area_um2":   float(df["Area_um2"].mean()) if len(df) else 0.0,
+        "median_area_um2": float(df["Area_um2"].median()) if len(df) else 0.0,
+        "um_per_px_png":   float(um_per_px_png)
+    }
+    return df, pd.DataFrame.from_dict(summary, orient="index", columns=["Value"])
+
+# ============== main per pair ==============
+def analyze_pair(tif_path, png_path):
+    stem = Path(png_path).stem
+    # start with defaults, then apply per-image overrides
+    params = dict(
+        LOCALMAX_MIN_DIST_PX=LOCALMAX_MIN_DIST_PX,
+        LOCALMAX_REL_THRESH=LOCALMAX_REL_THRESH,
+        TIFF_GATA_MIN_PCTL=TIFF_GATA_MIN_PCTL,
+        TIFF_C3_MIN_PCTL=TIFF_C3_MIN_PCTL,
+        GATA_RED_MARGIN=GATA_RED_MARGIN,
+        GATA_MIN_RED_FRAC=GATA_MIN_RED_FRAC,
+        C3_MAGENTA_MARGIN=C3_MAGENTA_MARGIN,
+        C3_MIN_MAGENTA_FRAC=C3_MIN_MAGENTA_FRAC,
+        HOTSPOT_TOP_PERCENT=HOTSPOT_TOP_PERCENT,
+        DENSITY_SMOOTH_SIGMA=DENSITY_SMOOTH_SIGMA,
+        PAIR_EXCLUSION_MODE=PAIR_EXCLUSION_MODE,
+    )
+    if stem in OVERRIDES:
+        params.update(OVERRIDES[stem])
+
+    print(f"\n[INFO] Pair:\n  TIFF: {tif_path}\n  PNG : {png_path}")
+    tif = load_tif_hwC(tif_path); Ht,Wt,_ = tif.shape
+    png = load_png_rgb(png_path);  Hp,Wp,_ = png.shape
+
+    um_per_px_png = png_um_per_px_from_tif((Ht,Wt), (Hp,Wp), UM_PER_PX_TIF)
+    print(f"[INFO] PNG scale: {um_per_px_png:.4f} µm/px")
+
+    # exclusion mask = scalebar ∪ ROI
+    excl = make_scalebar_mask(png)
+    if MANUAL_EXCLUDE_BOX is not None:
+        y0,y1,x0,x1 = MANUAL_EXCLUDE_BOX
+        manual = np.zeros((Hp,Wp), dtype=bool); manual[y0:y1, x0:x1] = True
+        excl |= manual
+    if stem in ROISET_EXCLUDE:
+        zippath = Path(png_path).with_name(ROISET_EXCLUDE[stem])
+        if zippath.exists():
+            roi_mask = roi_zip_to_mask(zippath, (Hp,Wp))
+            if ROI_EXCLUDE_MODE=="inside": excl |= roi_mask
+            else:                           excl |= ~roi_mask
+            print(f"[INFO] ROI-set applied.")
+        else:
+            print(f"[WARN] ROI-set not found: {zippath.name}")
+
+    # robust channels from PNG
+    gata = extract_gata_from_png(png); c3 = extract_c3_from_png(png)
+    gata[excl]=0; c3[excl]=0
+
+    # peaks (with per-image thresholds)
+    gata_pts = detect_local_maxima(gata, params["LOCALMAX_MIN_DIST_PX"], LOCALMAX_ABS_THRESH, params["LOCALMAX_REL_THRESH"])
+    c3_pts   = detect_local_maxima(c3,   params["LOCALMAX_MIN_DIST_PX"], LOCALMAX_ABS_THRESH, params["LOCALMAX_REL_THRESH"])
+
+    # color-purity filters on PNG RGB
+    margins = (APPLY_COLOR_FILTERS, params["GATA_RED_MARGIN"], params["GATA_MIN_RED_FRAC"],
+               params["C3_MAGENTA_MARGIN"], params["C3_MIN_MAGENTA_FRAC"])
+    gata_pts = filter_points_by_color(gata_pts, png, "gata", margins)
+    c3_pts   = filter_points_by_color(c3_pts,   png, "c3",   margins)
+
+    # TIFF gating (resize to PNG size)
+    if TIFF_GATE_ENABLED:
+        tif_gata = transform.resize(tif[..., TIFF_GATA_CHANNEL], (Hp,Wp), order=1, preserve_range=True, anti_aliasing=True)
+        tif_c3   = transform.resize(tif[..., TIFF_C3_CHANNEL],   (Hp,Wp), order=1, preserve_range=True, anti_aliasing=True)
+        gata_pts = gate_points_by_tiff(gata_pts, tif_gata, params["TIFF_GATA_MIN_PCTL"])
+        c3_pts   = gate_points_by_tiff(c3_pts,   tif_c3,   params["TIFF_C3_MIN_PCTL"])
+
+    print(f"[INFO] Peaks after gating — GATA3:{len(gata_pts)}  C3:{len(c3_pts)}")
+
+    # pair + exclusion logic
+    pairs = pair_list(c3_pts, gata_pts, PAIR_RADIUS_UM, um_per_px_png)
+    pairs = filter_pairs_by_exclusion(pairs, excl, mode=params["PAIR_EXCLUSION_MODE"])
+    mids  = midpoints_from_pairs(pairs)
+    print(f"[INFO] Pairs within {PAIR_RADIUS_UM} µm (kept): {len(mids)}")
+
+    # density & hotspots (with per-image calling)
+    _, mask = density_and_mask(mids, (Hp,Wp), sigma=params["DENSITY_SMOOTH_SIGMA"], top_percent=params["HOTSPOT_TOP_PERCENT"])
+
+    # outputs (with drawn scale bar)
+    out_dir = Path(png_path).resolve().parent / f"hotspot_fromPNG-{stem}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_pair_dots_exact(mids, (Hp,Wp), out_dir/"pair_dots.png", um_per_px_png)
+    save_hotspot_mask_exact(mask, out_dir/"hotspot_map.png", um_per_px_png)
+    save_overlay_on_png(png, mask, mids, out_dir/"overlay_hotspots_on_png.png", um_per_px_png)
+
+    # CSVs
+    pd.DataFrame(mids, columns=["row","col"]).to_csv(out_dir/"pair_midpoints.csv", index=False)
+    reg_df, summ_df = summarize_hotspots(mask, um_per_px_png)
+    reg_df.to_csv(out_dir/"hotspot_regions.csv", index=False)
+    summ_df.to_csv(out_dir/"hotspot_summary.csv")
+
+    # debug
+    io.imsave(str(out_dir/"DEBUG_gata_used.png"), (normalize_for_view(gata)*255).astype(np.uint8))
+    io.imsave(str(out_dir/"DEBUG_c3_used.png"),   (normalize_for_view(c3)*255).astype(np.uint8))
+    excl_vis = (excl.astype(np.uint8)*255)[...,None]
+    excl_rgb = np.concatenate([excl_vis, np.zeros_like(excl_vis), np.zeros_like(excl_vis)], axis=-1)
+    io.imsave(str(out_dir/"DEBUG_excluded_region.png"), excl_rgb)
+
+    print(f"[OK] Saved outputs in: {out_dir}")
+    return dict(points_GATA3=gata_pts, points_C3=c3_pts, pair_midpoints=mids, hotspot_mask=mask,
+                um_per_px_png=um_per_px_png, params=params)
+
+# ===== Run =====
+results = {}
+for tif_path, png_path in PAIRS:
+    if not Path(tif_path).exists():
+        print(f"[WARN] Missing TIFF: {tif_path}"); continue
+    if not Path(png_path).exists():
+        print(f"[WARN] Missing PNG:  {png_path}"); continue
+    results[(tif_path, png_path)] = analyze_pair(tif_path, png_path)
+
+print("\n[DONE]")
